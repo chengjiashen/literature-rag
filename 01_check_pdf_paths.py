@@ -5,52 +5,56 @@ This script reads document paths from PostgreSQL and reports any files
 that cannot be found on the local filesystem.
 """
 
-import os
 from pathlib import Path
 
 import psycopg
-from dotenv import load_dotenv
 
-
-load_dotenv()
+from config import (
+    DB_HOST,
+    DB_NAME,
+    DB_PASSWORD,
+    DB_PORT,
+    DB_USER,
+)
 
 
 def create_database_connection():
     """
-    Create a PostgreSQL connection using environment variables.
+    Create a PostgreSQL connection using project configuration.
 
     Returns:
         psycopg.Connection: An active PostgreSQL database connection.
 
     Raises:
-        RuntimeError: If any required database environment variable is missing.
+        RuntimeError: If any required database variable is missing.
     """
-    required_variables = [
-        "DB_NAME",
-        "DB_USER",
-        "DB_PASSWORD",
-        "DB_HOST",
-        "DB_PORT",
-    ]
+    required_variables = {
+        "DB_NAME": DB_NAME,
+        "DB_USER": DB_USER,
+        "DB_PASSWORD": DB_PASSWORD,
+        "DB_HOST": DB_HOST,
+        "DB_PORT": DB_PORT,
+    }
 
     missing_variables = [
-        variable
-        for variable in required_variables
-        if not os.getenv(variable)
+        variable_name
+        for variable_name, variable_value in required_variables.items()
+        if not variable_value
     ]
 
     if missing_variables:
         missing = ", ".join(missing_variables)
+
         raise RuntimeError(
             f"Missing required environment variables: {missing}"
         )
 
     return psycopg.connect(
-        dbname=os.getenv("DB_NAME"),
-        user=os.getenv("DB_USER"),
-        password=os.getenv("DB_PASSWORD"),
-        host=os.getenv("DB_HOST"),
-        port=os.getenv("DB_PORT"),
+        dbname=DB_NAME,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        host=DB_HOST,
+        port=int(DB_PORT),
     )
 
 
@@ -67,7 +71,10 @@ def get_document_paths(conn):
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT document_id, paper_id, file_path
+            SELECT
+                document_id,
+                paper_id,
+                file_path
             FROM documents
             ORDER BY document_id;
             """
@@ -94,7 +101,11 @@ def find_missing_files(documents):
 
         if not path.exists():
             missing_files.append(
-                (document_id, paper_id, file_path)
+                (
+                    document_id,
+                    paper_id,
+                    file_path,
+                )
             )
 
     return missing_files
