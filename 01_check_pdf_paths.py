@@ -7,55 +7,7 @@ that cannot be found on the local filesystem.
 
 from pathlib import Path
 
-import psycopg
-
-from config import (
-    DB_HOST,
-    DB_NAME,
-    DB_PASSWORD,
-    DB_PORT,
-    DB_USER,
-)
-
-
-def create_database_connection():
-    """
-    Create a PostgreSQL connection using project configuration.
-
-    Returns:
-        psycopg.Connection: An active PostgreSQL database connection.
-
-    Raises:
-        RuntimeError: If any required database variable is missing.
-    """
-    required_variables = {
-        "DB_NAME": DB_NAME,
-        "DB_USER": DB_USER,
-        "DB_PASSWORD": DB_PASSWORD,
-        "DB_HOST": DB_HOST,
-        "DB_PORT": DB_PORT,
-    }
-
-    missing_variables = [
-        variable_name
-        for variable_name, variable_value in required_variables.items()
-        if not variable_value
-    ]
-
-    if missing_variables:
-        missing = ", ".join(missing_variables)
-
-        raise RuntimeError(
-            f"Missing required environment variables: {missing}"
-        )
-
-    return psycopg.connect(
-        dbname=DB_NAME,
-        user=DB_USER,
-        password=DB_PASSWORD,
-        host=DB_HOST,
-        port=int(DB_PORT),
-    )
+from database import create_database_connection
 
 
 def get_document_paths(conn):
