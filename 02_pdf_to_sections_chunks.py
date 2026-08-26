@@ -18,12 +18,20 @@ Notes:
     - Page ranges are currently stored as NULL and can be added later.
 """
 
-import os
 import re
 from pathlib import Path
 
 import psycopg
-from dotenv import load_dotenv
+
+from config import (
+    CHUNK_OVERLAP,
+    CHUNK_SIZE,
+    DB_HOST,
+    DB_NAME,
+    DB_PASSWORD,
+    DB_PORT,
+    DB_USER,
+)
 
 try:
     import pymupdf
@@ -31,23 +39,86 @@ except ImportError:
     import fitz as pymupdf
 
 
-load_dotenv()
+# ============================================================
+# Database configuration
+# ============================================================
+
+def create_database_connection():
+    """
+    Create a PostgreSQL connection using project configuration.
+
+    Returns:
+        psycopg.Connection: An active PostgreSQL database connection.
+
+    Raises:
+        RuntimeError: If a required database variable is missing.
+    """
+    required_variables = {
+        "DB_NAME": DB_NAME,
+        "DB_USER": DB_USER,
+        "DB_PASSWORD": DB_PASSWORD,
+        "DB_HOST": DB_HOST,
+        "DB_PORT": DB_PORT,
+    }
+
+    missing_variables = [
+        variable_name
+        for variable_name, variable_value in required_variables.items()
+        if not variable_value
+    ]
+
+    if missing_variables:
+        missing = ", ".join(missing_variables)
+
+        raise RuntimeError(
+            f"Missing required environment variables: {missing}"
+        )
+
+    return psycopg.connect(
+        dbname=DB_NAME,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        host=DB_HOST,
+        port=int(DB_PORT),
+    )
 
 
 # ============================================================
-# Configuration
+# PDF text extraction
 # ============================================================
 
-CHUNK_SIZE = 1200
-CHUNK_OVERLAP = 200
+def extract_pdf_text(pdf_path):
+    """
+    Extract plain text from a PDF file.
 
-REQUIRED_DB_VARIABLES = (
-    "DB_NAME",
-    "DB_USER",
-    "DB_PASSWORD",
-    "DB_HOST",
-    "DB_PORT",
-)
+    Args:
+        pdf_path: Path to the PDF file.
+
+    Returns:
+        A single string containing extracted text from all pages.
+        Synthetic page markers are included for debugging and future
+        page-level metadata support.
+    """
+    pdf_path = Path(pdf_path)
+
+    with pymupdf.open(pdf_path) as document:
+        all_pages = []
+
+        for page_index in range(document.page_count):
+            page = document[page_index]
+            text = page.get_text("text", sort=True)
+
+            page_text = (
+                f"\n\n===== Page {page_index + 1} =====\n\n{text}"
+            )
+            all_pages.append(page_text)
+
+    return "\n".join(all_pages)
+
+
+# ============================================================
+# Section heading normalization
+# ============================================================
 
 MAJOR_SECTION_TITLES = {
     # Front matter
@@ -166,78 +237,6 @@ MAJOR_SECTION_TITLES = {
 }
 
 
-# ============================================================
-# Database configuration
-# ============================================================
-
-def create_database_connection():
-    """
-    Create a PostgreSQL connection using environment variables.
-
-    Returns:
-        psycopg.Connection: An active PostgreSQL database connection.
-
-    Raises:
-        RuntimeError: If a required database environment variable is missing.
-    """
-    missing_variables = [
-        variable
-        for variable in REQUIRED_DB_VARIABLES
-        if not os.getenv(variable)
-    ]
-
-    if missing_variables:
-        missing = ", ".join(missing_variables)
-        raise RuntimeError(
-            f"Missing required environment variables: {missing}"
-        )
-
-    return psycopg.connect(
-        dbname=os.getenv("DB_NAME"),
-        user=os.getenv("DB_USER"),
-        password=os.getenv("DB_PASSWORD"),
-        host=os.getenv("DB_HOST"),
-        port=os.getenv("DB_PORT"),
-    )
-
-
-# ============================================================
-# PDF text extraction
-# ============================================================
-
-def extract_pdf_text(pdf_path):
-    """
-    Extract plain text from a PDF file.
-
-    Args:
-        pdf_path: Path to the PDF file.
-
-    Returns:
-        A single string containing extracted text from all pages.
-        Synthetic page markers are included for debugging and future
-        page-level metadata support.
-    """
-    pdf_path = Path(pdf_path)
-
-    with pymupdf.open(pdf_path) as document:
-        all_pages = []
-
-        for page_index in range(document.page_count):
-            page = document[page_index]
-            text = page.get_text("text", sort=True)
-
-            page_text = (
-                f"\n\n===== Page {page_index + 1} =====\n\n{text}"
-            )
-            all_pages.append(page_text)
-
-    return "\n".join(all_pages)
-
-
-# ============================================================
-# Section heading normalization
-# ============================================================
-
 def normalize_heading_text(line):
     """
     Normalize a candidate heading for strict matching.
@@ -284,6 +283,7 @@ def normalize_heading_text(line):
 
     # Collapse whitespace and convert to lower case.
     line = re.sub(r"\s+", " ", line)
+
     return line.strip().lower()
 
 
@@ -365,11 +365,17 @@ def is_section_heading(line):
         return False
 
     # Exclude table-like rows containing notation and numeric values.
-    if "+" in original_line and re.search(r"\d+(\.\d+)?", original_line):
+    if "+" in original_line and re.search(
+        r"\d+(\.\d+)?",
+        original_line,
+    ):
         return False
 
     # Rows containing multiple numbers are often table rows.
-    numbers = re.findall(r"\d+(?:\.\d+)?", original_line)
+    numbers = re.findall(
+        r"\d+(?:\.\d+)?",
+        original_line,
+    )
 
     if len(numbers) >= 2:
         return False
@@ -420,11 +426,15 @@ def split_into_sections(full_text):
                 sections.append(
                     {
                         "heading": current_heading,
-                        "content": "\n".join(current_content).strip(),
+                        "content": "\n".join(
+                            current_content
+                        ).strip(),
                     }
                 )
 
-            display_heading = clean_heading_for_display(stripped_line)
+            display_heading = clean_heading_for_display(
+                stripped_line
+            )
 
             if not display_heading:
                 display_heading = normalize_heading_text(
@@ -441,7 +451,9 @@ def split_into_sections(full_text):
         sections.append(
             {
                 "heading": current_heading,
-                "content": "\n".join(current_content).strip(),
+                "content": "\n".join(
+                    current_content
+                ).strip(),
             }
         )
 
@@ -480,10 +492,14 @@ def split_text_into_chunks(
         Token-based chunking can be introduced in a later iteration.
     """
     if chunk_size <= 0:
-        raise ValueError("chunk_size must be greater than 0.")
+        raise ValueError(
+            "chunk_size must be greater than 0."
+        )
 
     if overlap < 0:
-        raise ValueError("overlap cannot be negative.")
+        raise ValueError(
+            "overlap cannot be negative."
+        )
 
     if overlap >= chunk_size:
         raise ValueError(
@@ -501,7 +517,10 @@ def split_text_into_chunks(
 
     while start < text_length:
         end = start + chunk_size
-        chunk_text = text[start:end].strip()
+
+        chunk_text = text[
+            start:end
+        ].strip()
 
         if chunk_text:
             chunks.append(chunk_text)
@@ -530,7 +549,10 @@ def get_documents_to_process(conn):
         and file_path.
     """
     sql = """
-        SELECT document_id, paper_id, file_path
+        SELECT
+            document_id,
+            paper_id,
+            file_path
         FROM documents
         ORDER BY document_id;
     """
@@ -549,7 +571,10 @@ def get_documents_to_process(conn):
     ]
 
 
-def delete_old_sections_and_chunks(conn, document_id):
+def delete_old_sections_and_chunks(
+    conn,
+    document_id,
+):
     """
     Remove previously generated sections and chunks for a document.
 
@@ -610,7 +635,16 @@ def insert_section(
             page_end,
             notes
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            %s
+        )
         RETURNING section_id;
     """
 
@@ -662,7 +696,16 @@ def insert_chunk(
             page_end,
             notes
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
+        VALUES (
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            %s
+        );
     """
 
     with conn.cursor() as cursor:
@@ -685,7 +728,10 @@ def insert_chunk(
 # Document-level processing
 # ============================================================
 
-def process_one_document(conn, document):
+def process_one_document(
+    conn,
+    document,
+):
     """
     Process one PDF from text extraction through database insertion.
 
@@ -703,24 +749,34 @@ def process_one_document(conn, document):
         f"Processing document_id={document_id}, "
         f"paper_id={paper_id}"
     )
-    print(f"PDF path: {file_path}")
+    print(
+        f"PDF path: {file_path}"
+    )
     print("=" * 80)
 
     pdf_path = Path(file_path)
 
     if not pdf_path.exists():
-        print(f"File not found. Skipping: {pdf_path}")
+        print(
+            f"File not found. Skipping: {pdf_path}"
+        )
         return
 
     full_text = extract_pdf_text(pdf_path)
 
     if not full_text.strip():
-        print(f"No text extracted. Skipping: {pdf_path}")
+        print(
+            f"No text extracted. Skipping: {pdf_path}"
+        )
         return
 
-    sections = split_into_sections(full_text)
+    sections = split_into_sections(
+        full_text
+    )
 
-    print(f"Detected sections: {len(sections)}")
+    print(
+        f"Detected sections: {len(sections)}"
+    )
 
     delete_old_sections_and_chunks(
         conn=conn,
@@ -744,7 +800,9 @@ def process_one_document(conn, document):
             section_title=section_title,
         )
 
-        chunks = split_text_into_chunks(section_content)
+        chunks = split_text_into_chunks(
+            section_content
+        )
 
         for chunk_index, chunk_text in enumerate(
             chunks,
@@ -762,7 +820,8 @@ def process_one_document(conn, document):
         total_chunks += len(chunks)
 
         print(
-            f"  Section {section_index}: {section_title} | "
+            f"  Section {section_index}: "
+            f"{section_title} | "
             f"characters={len(section_content)} | "
             f"chunks={len(chunks)}"
         )
@@ -787,10 +846,13 @@ def main():
     completed documents.
     """
     with create_database_connection() as conn:
-        documents = get_documents_to_process(conn)
+        documents = get_documents_to_process(
+            conn
+        )
 
         print(
-            f"Found {len(documents)} documents in the database."
+            f"Found {len(documents)} documents "
+            "in the database."
         )
 
         for document in documents:
@@ -811,10 +873,15 @@ def main():
                     "\nProcessing failed. "
                     "Transaction rolled back."
                 )
+
                 print(
-                    f"document_id: {document['document_id']}"
+                    f"document_id: "
+                    f"{document['document_id']}"
                 )
-                print(f"error: {error}")
+
+                print(
+                    f"error: {error}"
+                )
 
 
 if __name__ == "__main__":
