@@ -21,17 +21,11 @@ Notes:
 import re
 from pathlib import Path
 
-import psycopg
-
 from config import (
     CHUNK_OVERLAP,
     CHUNK_SIZE,
-    DB_HOST,
-    DB_NAME,
-    DB_PASSWORD,
-    DB_PORT,
-    DB_USER,
 )
+from database import create_database_connection
 
 try:
     import pymupdf
@@ -40,84 +34,7 @@ except ImportError:
 
 
 # ============================================================
-# Database configuration
-# ============================================================
-
-def create_database_connection():
-    """
-    Create a PostgreSQL connection using project configuration.
-
-    Returns:
-        psycopg.Connection: An active PostgreSQL database connection.
-
-    Raises:
-        RuntimeError: If a required database variable is missing.
-    """
-    required_variables = {
-        "DB_NAME": DB_NAME,
-        "DB_USER": DB_USER,
-        "DB_PASSWORD": DB_PASSWORD,
-        "DB_HOST": DB_HOST,
-        "DB_PORT": DB_PORT,
-    }
-
-    missing_variables = [
-        variable_name
-        for variable_name, variable_value in required_variables.items()
-        if not variable_value
-    ]
-
-    if missing_variables:
-        missing = ", ".join(missing_variables)
-
-        raise RuntimeError(
-            f"Missing required environment variables: {missing}"
-        )
-
-    return psycopg.connect(
-        dbname=DB_NAME,
-        user=DB_USER,
-        password=DB_PASSWORD,
-        host=DB_HOST,
-        port=int(DB_PORT),
-    )
-
-
-# ============================================================
-# PDF text extraction
-# ============================================================
-
-def extract_pdf_text(pdf_path):
-    """
-    Extract plain text from a PDF file.
-
-    Args:
-        pdf_path: Path to the PDF file.
-
-    Returns:
-        A single string containing extracted text from all pages.
-        Synthetic page markers are included for debugging and future
-        page-level metadata support.
-    """
-    pdf_path = Path(pdf_path)
-
-    with pymupdf.open(pdf_path) as document:
-        all_pages = []
-
-        for page_index in range(document.page_count):
-            page = document[page_index]
-            text = page.get_text("text", sort=True)
-
-            page_text = (
-                f"\n\n===== Page {page_index + 1} =====\n\n{text}"
-            )
-            all_pages.append(page_text)
-
-    return "\n".join(all_pages)
-
-
-# ============================================================
-# Section heading normalization
+# Section heading configuration
 # ============================================================
 
 MAJOR_SECTION_TITLES = {
@@ -237,6 +154,43 @@ MAJOR_SECTION_TITLES = {
 }
 
 
+# ============================================================
+# PDF text extraction
+# ============================================================
+
+def extract_pdf_text(pdf_path):
+    """
+    Extract plain text from a PDF file.
+
+    Args:
+        pdf_path: Path to the PDF file.
+
+    Returns:
+        A single string containing extracted text from all pages.
+        Synthetic page markers are included for debugging and future
+        page-level metadata support.
+    """
+    pdf_path = Path(pdf_path)
+
+    with pymupdf.open(pdf_path) as document:
+        all_pages = []
+
+        for page_index in range(document.page_count):
+            page = document[page_index]
+            text = page.get_text("text", sort=True)
+
+            page_text = (
+                f"\n\n===== Page {page_index + 1} =====\n\n{text}"
+            )
+            all_pages.append(page_text)
+
+    return "\n".join(all_pages)
+
+
+# ============================================================
+# Section heading normalization
+# ============================================================
+
 def normalize_heading_text(line):
     """
     Normalize a candidate heading for strict matching.
@@ -279,10 +233,18 @@ def normalize_heading_text(line):
     )
 
     # Keep only letters, whitespace, and hyphens.
-    line = re.sub(r"[^A-Za-z\s\-]", " ", line)
+    line = re.sub(
+        r"[^A-Za-z\s\-]",
+        " ",
+        line,
+    )
 
     # Collapse whitespace and convert to lower case.
-    line = re.sub(r"\s+", " ", line)
+    line = re.sub(
+        r"\s+",
+        " ",
+        line,
+    )
 
     return line.strip().lower()
 
@@ -294,7 +256,11 @@ def clean_heading_for_display(line):
     The returned value is stored in sections.section_title.
     """
     line = line.strip()
-    line = re.sub(r"\s+", " ", line)
+    line = re.sub(
+        r"\s+",
+        " ",
+        line,
+    )
 
     line = re.sub(
         r"^\d+(\.\d+)*\.?\s+",
@@ -346,7 +312,11 @@ def is_section_heading(line):
     if not original_line:
         return False
 
-    original_line = re.sub(r"\s+", " ", original_line)
+    original_line = re.sub(
+        r"\s+",
+        " ",
+        original_line,
+    )
 
     # Ignore synthetic page markers added during PDF extraction.
     if original_line.startswith("===== Page"):
@@ -380,7 +350,9 @@ def is_section_heading(line):
     if len(numbers) >= 2:
         return False
 
-    normalized = normalize_heading_text(original_line)
+    normalized = normalize_heading_text(
+        original_line
+    )
 
     if not normalized:
         return False
@@ -749,9 +721,7 @@ def process_one_document(
         f"Processing document_id={document_id}, "
         f"paper_id={paper_id}"
     )
-    print(
-        f"PDF path: {file_path}"
-    )
+    print(f"PDF path: {file_path}")
     print("=" * 80)
 
     pdf_path = Path(file_path)
@@ -762,7 +732,9 @@ def process_one_document(
         )
         return
 
-    full_text = extract_pdf_text(pdf_path)
+    full_text = extract_pdf_text(
+        pdf_path
+    )
 
     if not full_text.strip():
         print(
