@@ -13,24 +13,41 @@ Pipeline:
         -> sections and chunks tables
 
 Notes:
+    - Requires migrations 001 and 002; defaults to validating literature_rag_dev.
+    - Unchanged successfully processed documents are skipped.
+    - Changed output and successful metadata commit atomically per document.
     - Section detection is rule-based and intentionally conservative.
     - Chunks are character-based rather than token-based.
     - Page ranges are currently stored as NULL and can be added later.
 """
 
+import argparse
+import hashlib
+import json
+import logging
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 
 from config import (
     CHUNK_OVERLAP,
     CHUNK_SIZE,
 )
-from database import create_database_connection
 
 try:
     import pymupdf
 except ImportError:
     import fitz as pymupdf
+
+
+# Bump this when extraction, normalization, sectioning or chunking logic changes.
+# Chunk parameters, heading vocabulary and PyMuPDF version are included separately.
+PARSER_RULES_VERSION = "section-parser-v2"
+LOGGER = logging.getLogger(__name__)
+REQUIRED_METADATA_COLUMNS = {
+    "parse_status", "parsed_file_sha256", "parse_pipeline_version",
+    "parsed_at", "last_parse_attempt_at", "parse_error",
+}
 
 
 # ============================================================
@@ -158,31 +175,36 @@ MAJOR_SECTION_TITLES = {
 # PDF text extraction
 # ============================================================
 
-def extract_pdf_text(pdf_path):
+def extract_pdf_text(pdf_bytes):
     """
     Extract plain text from a PDF file.
 
     Args:
-        pdf_path: Path to the PDF file.
+        pdf_bytes: The same immutable bytes used to compute the file hash.
 
     Returns:
         A single string containing extracted text from all pages.
         Synthetic page markers are included for debugging and future
         page-level metadata support.
     """
-    pdf_path = Path(pdf_path)
-
-    with pymupdf.open(pdf_path) as document:
+    with pymupdf.open(stream=pdf_bytes, filetype="pdf") as document:
+        if document.needs_pass:
+            raise ValueError("Password-protected PDF requires a decrypted copy.")
         all_pages = []
+        has_body_text = False
 
         for page_index in range(document.page_count):
             page = document[page_index]
             text = page.get_text("text", sort=True)
+            has_body_text = has_body_text or bool(text.strip())
 
             page_text = (
                 f"\n\n===== Page {page_index + 1} =====\n\n{text}"
             )
             all_pages.append(page_text)
+
+    if not has_body_text:
+        raise ValueError("No extractable text. The PDF may require OCR.")
 
     return "\n".join(all_pages)
 
@@ -509,7 +531,7 @@ def split_text_into_chunks(
 # Database access
 # ============================================================
 
-def get_documents_to_process(conn):
+def get_documents_to_process(conn, document_ids=None):
     """
     Retrieve PDF records from the documents table.
 
@@ -522,15 +544,22 @@ def get_documents_to_process(conn):
     """
     sql = """
         SELECT
-            document_id,
-            paper_id,
-            file_path
-        FROM documents
-        ORDER BY document_id;
+            d.document_id, d.paper_id, d.file_path,
+            d.parse_status, d.parsed_file_sha256, d.parse_pipeline_version,
+            EXISTS (SELECT 1 FROM public.sections s
+                    WHERE s.document_id = d.document_id) AS has_sections,
+            EXISTS (SELECT 1 FROM public.chunks c
+                    WHERE c.document_id = d.document_id) AS has_chunks
+        FROM public.documents d
     """
+    parameters = ()
+    if document_ids:
+        sql += " WHERE d.document_id = ANY(%s)"
+        parameters = (document_ids,)
+    sql += " ORDER BY d.document_id;"
 
     with conn.cursor() as cursor:
-        cursor.execute(sql)
+        cursor.execute(sql, parameters)
         rows = cursor.fetchall()
 
     return [
@@ -538,6 +567,11 @@ def get_documents_to_process(conn):
             "document_id": row[0],
             "paper_id": row[1],
             "file_path": row[2],
+            "parse_status": row[3],
+            "parsed_file_sha256": row[4],
+            "parse_pipeline_version": row[5],
+            "has_sections": row[6],
+            "has_chunks": row[7],
         }
         for row in rows
     ]
@@ -561,7 +595,7 @@ def delete_old_sections_and_chunks(
     with conn.cursor() as cursor:
         cursor.execute(
             """
-            DELETE FROM chunks
+            DELETE FROM public.chunks
             WHERE document_id = %s;
             """,
             (document_id,),
@@ -569,7 +603,7 @@ def delete_old_sections_and_chunks(
 
         cursor.execute(
             """
-            DELETE FROM sections
+            DELETE FROM public.sections
             WHERE document_id = %s;
             """,
             (document_id,),
@@ -597,7 +631,7 @@ def insert_section(
         The generated section_id.
     """
     sql = """
-        INSERT INTO sections (
+        INSERT INTO public.sections (
             paper_id,
             document_id,
             section_title,
@@ -658,7 +692,7 @@ def insert_chunk(
         chunk_text: Text stored for the chunk.
     """
     sql = """
-        INSERT INTO chunks (
+        INSERT INTO public.chunks (
             paper_id,
             document_id,
             section_id,
@@ -700,161 +734,249 @@ def insert_chunk(
 # Document-level processing
 # ============================================================
 
-def process_one_document(
-    conn,
-    document,
-):
-    """
-    Process one PDF from text extraction through database insertion.
+def build_pipeline_version():
+    """Identify both the algorithm revision and its effective configuration."""
+    settings = {
+        "rules_version": PARSER_RULES_VERSION,
+        "chunk_size": CHUNK_SIZE,
+        "chunk_overlap": CHUNK_OVERLAP,
+        "headings": sorted(MAJOR_SECTION_TITLES),
+        "pymupdf_version": pymupdf.VersionBind,
+    }
+    encoded = json.dumps(settings, sort_keys=True, separators=(",", ":")).encode()
+    return f"{PARSER_RULES_VERSION}:{hashlib.sha256(encoded).hexdigest()}"
 
-    Args:
-        conn: Active PostgreSQL database connection.
-        document: Dictionary containing document_id, paper_id,
-            and file_path.
-    """
-    document_id = document["document_id"]
-    paper_id = document["paper_id"]
-    file_path = document["file_path"]
 
-    print("\n" + "=" * 80)
-    print(
-        f"Processing document_id={document_id}, "
-        f"paper_id={paper_id}"
-    )
-    print(f"PDF path: {file_path}")
-    print("=" * 80)
-
-    pdf_path = Path(file_path)
-
-    if not pdf_path.exists():
-        print(
-            f"File not found. Skipping: {pdf_path}"
-        )
-        return
-
-    full_text = extract_pdf_text(
-        pdf_path
+def should_skip_document(document, file_hash, pipeline_version, force=False):
+    """Skip only a verified success with matching inputs and existing output."""
+    return (
+        not force
+        and document["parse_status"] == "completed"
+        and document["parsed_file_sha256"] == file_hash
+        and document["parse_pipeline_version"] == pipeline_version
+        and document["has_sections"]
+        and document["has_chunks"]
     )
 
-    if not full_text.strip():
-        print(
-            f"No text extracted. Skipping: {pdf_path}"
-        )
-        return
 
-    sections = split_into_sections(
-        full_text
-    )
-
-    print(
-        f"Detected sections: {len(sections)}"
-    )
-
-    delete_old_sections_and_chunks(
-        conn=conn,
-        document_id=document_id,
-    )
-
-    total_chunks = 0
-
-    for section_index, section in enumerate(
-        sections,
-        start=1,
-    ):
-        section_title = section["heading"]
-        section_content = section["content"]
-
-        section_id = insert_section(
-            conn=conn,
-            paper_id=paper_id,
-            document_id=document_id,
-            section_order=section_index,
-            section_title=section_title,
-        )
-
+def prepare_sections(pdf_bytes):
+    """Extract and validate all text/chunks before deleting any existing output."""
+    full_text = extract_pdf_text(pdf_bytes)
+    # Page markers are useful while extracting but are not evidence text.
+    full_text = re.sub(r"(?m)^===== Page \d+ =====\s*$", "", full_text)
+    prepared = []
+    for section in split_into_sections(full_text):
         chunks = split_text_into_chunks(
-            section_content
+            section["content"], chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP
         )
+        if chunks:
+            prepared.append({"heading": section["heading"], "chunks": chunks})
+    if not prepared:
+        raise ValueError("No usable section text or chunks were extracted.")
+    return prepared
 
-        for chunk_index, chunk_text in enumerate(
-            chunks,
-            start=1,
-        ):
-            insert_chunk(
-                conn=conn,
-                paper_id=paper_id,
-                document_id=document_id,
-                section_id=section_id,
-                chunk_order=chunk_index,
-                chunk_text=chunk_text,
+
+def mark_processing(conn, document_id, attempted_at):
+    """Persist the start independently, so a crash leaves a retryable state."""
+    with conn.cursor() as cursor:
+        cursor.execute(
+            """UPDATE public.documents
+               SET parse_status = 'processing', last_parse_attempt_at = %s,
+                   parse_error = NULL
+               WHERE document_id = %s""",
+            (attempted_at, document_id),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError(f"Document {document_id} no longer exists.")
+
+
+def record_failure(conn, document_id, attempted_at, error):
+    """Leave the previous successful fingerprint/version/time untouched."""
+    message = f"{type(error).__name__}: {error}"[:2000]
+    with conn.cursor() as cursor:
+        cursor.execute(
+            """UPDATE public.documents
+               SET parse_status = 'failed', last_parse_attempt_at = %s,
+                   parse_error = %s
+               WHERE document_id = %s""",
+            (attempted_at, message, document_id),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError(f"Cannot record failure: document {document_id} is missing.")
+
+
+def replace_document_output(conn, document, sections, file_hash, pipeline_version):
+    """Commit output and success metadata together, or roll them all back."""
+    document_id = document["document_id"]
+    with conn.transaction():
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """SELECT paper_id, file_path FROM public.documents
+                   WHERE document_id = %s FOR UPDATE""",
+                (document_id,),
             )
+            current_source = cursor.fetchone()
+            if current_source != (document["paper_id"], document["file_path"]):
+                raise RuntimeError("Document registration changed during processing; retry.")
 
-        total_chunks += len(chunks)
+        delete_old_sections_and_chunks(conn, document_id)
+        total_chunks = 0
+        for section_order, section in enumerate(sections, start=1):
+            section_id = insert_section(
+                conn, document["paper_id"], document_id,
+                section_order, section["heading"],
+            )
+            for chunk_order, chunk_text in enumerate(section["chunks"], start=1):
+                insert_chunk(
+                    conn, document["paper_id"], document_id,
+                    section_id, chunk_order, chunk_text,
+                )
+                total_chunks += 1
 
-        print(
-            f"  Section {section_index}: "
-            f"{section_title} | "
-            f"characters={len(section_content)} | "
-            f"chunks={len(chunks)}"
-        )
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """UPDATE public.documents
+                   SET parse_status = 'completed', parsed_file_sha256 = %s,
+                       parse_pipeline_version = %s, parsed_at = clock_timestamp(),
+                       parse_error = NULL
+                   WHERE document_id = %s""",
+                (file_hash, pipeline_version, document_id),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("Cannot save document completion metadata.")
+    return total_chunks
 
-    print(
-        f"Completed document_id={document_id}: "
-        f"sections={len(sections)}, "
-        f"chunks={total_chunks}"
-    )
 
+def process_one_document(
+    conn, document, pipeline_version=None, force=False, rebuild_untracked=False
+):
+    """Process one document on an autocommit connection with explicit transactions.
 
-# ============================================================
-# Entry point
-# ============================================================
-
-def main():
+    The caller holds the pipeline advisory lock. All hashes describe the exact
+    in-memory bytes parsed. Successful old output survives extraction/SQL errors.
     """
-    Run the PDF-to-chunk ETL pipeline for all registered documents.
+    if not conn.autocommit:
+        raise ValueError("Use autocommit with explicit per-document transactions.")
+    pipeline_version = pipeline_version or build_pipeline_version()
+    document_id = document["document_id"]
 
-    Each document is committed independently. If processing one document
-    fails, its transaction is rolled back without discarding previously
-    completed documents.
-    """
-    with create_database_connection() as conn:
-        documents = get_documents_to_process(
-            conn
+    # Historical chunks have no trustworthy provenance. Do not silently rebuild
+    # and discard their embeddings. The caller must opt into a deliberate rebuild.
+    if (
+        document["parsed_file_sha256"] is None
+        and (document["has_sections"] or document["has_chunks"])
+        and not rebuild_untracked
+    ):
+        LOGGER.warning(
+            "document_id=%s BLOCKED: existing output has no successful fingerprint. "
+            "Use --rebuild-untracked only for a deliberate rebuild; embeddings "
+            "for that document will need regeneration.", document_id,
+        )
+        return "blocked"
+
+    attempted_at = datetime.now(timezone.utc)
+    try:
+        # Read once: hashing and extraction cannot accidentally use different bytes.
+        pdf_bytes = Path(document["file_path"]).read_bytes()
+        file_hash = hashlib.sha256(pdf_bytes).hexdigest()
+        if should_skip_document(document, file_hash, pipeline_version, force):
+            return "skipped"
+
+        mark_processing(conn, document_id, attempted_at)
+        sections = prepare_sections(pdf_bytes)
+        replace_document_output(conn, document, sections, file_hash, pipeline_version)
+    except KeyboardInterrupt as error:
+        record_failure(conn, document_id, attempted_at, error)
+        raise
+    except Exception as error:
+        # conn.transaction() has already rolled back replacement writes if needed.
+        # Autocommit saves this failure separately from that failed transaction.
+        record_failure(conn, document_id, attempted_at, error)
+        LOGGER.error("document_id=%s FAILED: %s: %s", document_id, type(error).__name__, error)
+        return "failed"
+    return "processed"
+
+
+def validate_target_database(conn, expected_database):
+    with conn.cursor() as cursor:
+        cursor.execute("SELECT current_database()")
+        actual_database = cursor.fetchone()[0]
+        if actual_database != expected_database:
+            raise RuntimeError(
+                f"Connected to {actual_database!r}, expected {expected_database!r}. "
+                "For this test set DB_NAME=literature_rag_dev in your local .env."
+            )
+        cursor.execute(
+            """SELECT column_name FROM information_schema.columns
+               WHERE table_schema = 'public' AND table_name = 'documents'"""
+        )
+        columns = {row[0] for row in cursor.fetchall()}
+    missing = REQUIRED_METADATA_COLUMNS - columns
+    if missing:
+        raise RuntimeError(
+            "Apply migration 002 first. Missing columns: " + ", ".join(sorted(missing))
         )
 
-        print(
-            f"Found {len(documents)} documents "
-            "in the database."
-        )
 
-        for document in documents:
-            try:
-                process_one_document(
-                    conn=conn,
-                    document=document,
+def acquire_pipeline_lock(conn):
+    """Serialize this parser's runs; the connection releases the lock on close."""
+    with conn.cursor() as cursor:
+        cursor.execute("SELECT pg_try_advisory_lock(%s, %s)", (71402, 1))
+        if not cursor.fetchone()[0]:
+            raise RuntimeError("Another incremental PDF parser is running; retry later.")
+
+
+def parse_arguments(argv=None):
+    parser = argparse.ArgumentParser(description="Incremental PDF-to-chunk ingestion.")
+    parser.add_argument("--document-id", type=int, action="append",
+                        help="Process only this ID; repeat to select several documents.")
+    parser.add_argument("--expected-database", default="literature_rag_dev",
+                        help="Require this database name; does not change the connection.")
+    parser.add_argument("--force", action="store_true",
+                        help="Rebuild tracked documents even if unchanged.")
+    parser.add_argument("--rebuild-untracked", action="store_true",
+                        help="Explicitly rebuild legacy output with no successful hash.")
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_arguments(argv)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    counts = {key: 0 for key in ("processed", "skipped", "failed", "blocked")}
+    try:
+        # Lazy import lets --help and pure parsing tests run without a DB driver.
+        from database import create_database_connection
+
+        # Check config before touching a database or marking any document started.
+        split_text_into_chunks("configuration check", CHUNK_SIZE, CHUNK_OVERLAP)
+        pipeline_version = build_pipeline_version()
+        with create_database_connection() as conn:
+            conn.autocommit = True
+            validate_target_database(conn, args.expected_database)
+            acquire_pipeline_lock(conn)
+            documents = get_documents_to_process(conn, args.document_id)
+            if args.document_id:
+                missing = set(args.document_id) - {d["document_id"] for d in documents}
+                if missing:
+                    raise RuntimeError(f"Document IDs not found: {sorted(missing)}")
+            if not documents:
+                LOGGER.info("No registered documents. Prepare a demo PDF before testing.")
+            LOGGER.info("Documents=%s pipeline_version=%s", len(documents), pipeline_version)
+            for document in documents:
+                result = process_one_document(
+                    conn, document, pipeline_version, args.force, args.rebuild_untracked
                 )
-
-                # Commit after each document so one failed PDF does not
-                # discard successfully processed previous documents.
-                conn.commit()
-
-            except Exception as error:
-                conn.rollback()
-
-                print(
-                    "\nProcessing failed. "
-                    "Transaction rolled back."
-                )
-
-                print(
-                    f"document_id: "
-                    f"{document['document_id']}"
-                )
-
-                print(
-                    f"error: {error}"
-                )
+                counts[result] += 1
+                LOGGER.info("document_id=%s result=%s", document["document_id"], result)
+    except KeyboardInterrupt:
+        LOGGER.warning("Interrupted. Completed documents remain saved; retry this command.")
+        return 130
+    except Exception as error:
+        LOGGER.error("Pipeline stopped: %s: %s", type(error).__name__, error)
+        return 2
+    LOGGER.info("SUMMARY %s", " ".join(f"{k}={v}" for k, v in counts.items()))
+    return 1 if counts["failed"] or counts["blocked"] else 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
