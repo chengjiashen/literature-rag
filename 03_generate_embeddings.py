@@ -1,3 +1,5 @@
+import argparse
+
 import numpy as np
 from openai import OpenAI
 
@@ -25,7 +27,7 @@ def validate_openai_configuration():
 # Database status
 # =========================================================
 
-def get_embedding_status(connection):
+def get_embedding_status(connection, document_id=None):
     """
     Return the current embedding progress in the chunks table.
 
@@ -58,11 +60,16 @@ def get_embedding_status(connection):
                   )
             ) AS empty_text_chunks
 
-        FROM chunks;
+        FROM chunks
     """
 
+    params = ()
+    if document_id is not None:
+        query += " WHERE document_id = %s"
+        params = (document_id,)
+
     with connection.cursor() as cursor:
-        cursor.execute(query)
+        cursor.execute(query, params)
         status = cursor.fetchone()
 
     # End the read-only transaction.
@@ -102,7 +109,7 @@ def print_embedding_status(status, title):
 # Load one batch
 # =========================================================
 
-def load_next_batch(connection, batch_size):
+def load_next_batch(connection, batch_size, document_id=None):
     """
     Load the next batch of chunks whose embeddings are still NULL.
 
@@ -126,12 +133,16 @@ def load_next_batch(connection, batch_size):
         WHERE embedding IS NULL
           AND chunk_text IS NOT NULL
           AND BTRIM(chunk_text) <> ''
-        ORDER BY chunk_id
-        LIMIT %s;
     """
+    params = []
+    if document_id is not None:
+        query += " AND document_id = %s"
+        params.append(document_id)
+    query += " ORDER BY chunk_id LIMIT %s"
+    params.append(batch_size)
 
     with connection.cursor() as cursor:
-        cursor.execute(query, (batch_size,))
+        cursor.execute(query, params)
         rows = cursor.fetchall()
 
     # Close the read transaction before making the API request.
@@ -365,7 +376,7 @@ def verify_saved_batch(connection, chunk_ids):
 # Main program
 # =========================================================
 
-def main():
+def main(argv=None):
     """
     Generate embeddings for all valid chunks that currently have
     a NULL embedding.
@@ -382,17 +393,12 @@ def main():
 
     Existing embeddings are not regenerated or overwritten.
     """
-    validate_openai_configuration()
-
-    openai_client = OpenAI(
-        api_key=OPENAI_API_KEY,
-
-        # Retry temporary connection, rate-limit, and server errors.
-        max_retries=5,
-
-        # Maximum time allowed for one API request.
-        timeout=120.0,
-    )
+    parser = argparse.ArgumentParser(description="Generate missing chunk embeddings.")
+    parser.add_argument("--document-id", type=int, help="Process only this document.")
+    args = parser.parse_args(argv)
+    document_id = args.document_id
+    if document_id is not None and document_id < 1:
+        parser.error("--document-id must be a positive integer")
 
     connection = None
 
@@ -405,7 +411,10 @@ def main():
 
         connection = create_database_connection(register_pgvector=True)
 
-        initial_status = get_embedding_status(connection)
+        if document_id is not None:
+            print(f"Selected document ID: {document_id}")
+
+        initial_status = get_embedding_status(connection, document_id)
 
         print_embedding_status(
             initial_status,
@@ -419,6 +428,18 @@ def main():
             print("No valid chunks require embeddings.")
             print("Existing embeddings were left unchanged.")
             return
+
+        validate_openai_configuration()
+
+        openai_client = OpenAI(
+            api_key=OPENAI_API_KEY,
+
+            # Retry temporary connection, rate-limit, and server errors.
+            max_retries=5,
+
+            # Maximum time allowed for one API request.
+            timeout=120.0,
+        )
 
         print()
         print(f"Embedding model: {EMBEDDING_MODEL}")
@@ -440,6 +461,7 @@ def main():
             batch_rows = load_next_batch(
                 connection=connection,
                 batch_size=EMBEDDING_BATCH_SIZE,
+                document_id=document_id,
             )
 
             if not batch_rows:
@@ -492,7 +514,7 @@ def main():
             processed_this_run += len(batch_rows)
             total_tokens_this_run += batch_tokens
 
-            current_status = get_embedding_status(connection)
+            current_status = get_embedding_status(connection, document_id)
             remaining_chunks = current_status[2]
 
             print("Batch saved and verified successfully.")
@@ -507,7 +529,7 @@ def main():
                 f"{total_tokens_this_run}"
             )
 
-        final_status = get_embedding_status(connection)
+        final_status = get_embedding_status(connection, document_id)
 
         print_embedding_status(
             final_status,
